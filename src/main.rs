@@ -1,37 +1,47 @@
+#![feature(proc_macro)]
+
 extern crate hyper;
+extern crate maud;
 extern crate futures;
 extern crate url;
 
-#![feature(proc_macro)]
-extern crate maud;
+#[macro_use]
+extern crate serde_json;
+
+#[macro_use]
+extern crate serde_derive;
+
+#[macro_use]
+extern crate diesel;
 
 #[macro_use]
 extern crate log;
 extern crate env_logger;
 
-#[macro_use]
-extern crate serde_json;
-
 use std::collections::HashMap;
+use std::error::Error;
 use std::env;
 use std::io;
 
-use hyper::server::{Request, Response, Service};
-use hyper::header::{ContentLength, ContentType};
 use hyper::{Chunk, StatusCode};
 use hyper::Method::{Get, Post};
+use hyper::server::{Request, Response, Service};
+use hyper::header::{ContentLength, ContentType};
 
-use futures::future::{Future, FutureResult};
 use futures::Stream;
+use futures::future::{Future, FutureResult};
 
+use diesel::prelude::*;
+use diesel::pg::PgConnection;
 
-#[macro_use]
-extern crate serde_derive;
-#[macro_use]
-extern crate diesel;
+use maud::html;
 
-mod schema;
 mod models;
+mod schema;
+
+use models::{Message, NewMessage};
+
+const DEFAULT_DATABASE_URL: &'static str = "postgresql://postgres@localhost:5432";
 
 struct Microservice;
 
@@ -40,25 +50,77 @@ struct TimeRange {
     after: Option<i64>,
 }
 
-struct Message {
-    username: String,
-    message: String,
+fn parse_form(form_chunk: Chunk) -> FutureResult<NewMessage, hyper::Error> {
+    let mut form = url::form_urlencoded::parse(form_chunk.as_ref())
+        .into_owned()
+        .collect::<HashMap<String, String>>();
+
+    if let Some(message) = form.remove("message") {
+        let username = form.remove("username").unwrap_or(String::from("anonymous"));
+        futures::future::ok(NewMessage {
+            username: username,
+            message: message,
+        })
+    } else {
+        futures::future::err(hyper::Error::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Missing field 'message",
+        )))
+    }
 }
 
+fn write_to_db(
+    new_message: NewMessage,
+    db_connection: &PgConnection,
+) -> FutureResult<i64, hyper::Error> {
+    use schema::messages;
+    let timestamp = diesel::insert_into(messages::table)
+        .values(&new_message)
+        .returning(messages::timestamp)
+        .get_result(db_connection);
 
-const DEFAULT_DATABASE_URL: &'static str = "postgresql://postgres@localhost:5432";
-
-fn connect_to_db() -> Option<PgConnection> {
-    let database_url = env::var("DATABASE_URL").unwrap_or(String::from(DEFAULT_DATABASE_URL));
-    match PgConnection::establish(&database_url) {
-        Ok(connection) => Some(connection),
+    match timestamp {
+        Ok(timestamp) => futures::future::ok(timestamp),
         Err(error) => {
-            error!("Error connecting to database: {}", error.description());
-            None
+            error!("Error writing to database: {}", error.description());
+            futures::future::err(hyper::Error::from(
+                io::Error::new(io::ErrorKind::Other, "service error"),
+            ))
         }
     }
 }
 
+fn make_error_response(error_message: &str) -> FutureResult<hyper::Response, hyper::Error> {
+    let payload = json!({
+        "error": error_message
+    }).to_string();
+    let response = Response::new()
+        .with_status(StatusCode::InternalServerError)
+        .with_header(ContentLength(payload.len() as u64))
+        .with_header(ContentType::json())
+        .with_body(payload);
+    debug!("{:?}", response);
+    futures::future::ok(response)
+}
+
+fn make_post_response(
+    result: Result<i64, hyper::Error>,
+) -> FutureResult<hyper::Response, hyper::Error> {
+    match result {
+        Ok(timestamp) => {
+            let payload = json!({
+                "timestamp": timestamp
+            }).to_string();
+            let response = Response::new()
+                .with_header(ContentLength(payload.len() as u64))
+                .with_header(ContentType::json())
+                .with_body(payload);
+            debug!("{:?}", response);
+            futures::future::ok(response)
+        }
+        Err(error) => make_error_response(error.description()),
+    }
+}
 
 fn parse_query(query: &str) -> Result<TimeRange, String> {
     let args = url::form_urlencoded::parse(&query.as_bytes())
@@ -83,46 +145,6 @@ fn parse_query(query: &str) -> Result<TimeRange, String> {
         before: before.map(|b| b.unwrap()),
         after: after.map(|a| a.unwrap()),
     })
-}
-
-fn parse_form(form_chunk: Chunk) -> FutureResult<Message, hyper::Error> {
-    let mut form = url::form_urlencoded::parse(form_chunk.as_ref())
-        .into_owned()
-        .collect::<HashMap<String, String>>();
-    
-    if let Some(message) = form.remove("message") {
-        let username = form.remove("username").unwrap_or(String::from("anonymous"));
-        futures::future::ok(Message {
-            username: username,
-            message: message,
-        })
-    } else {
-        futures::future::err(hyper::Error::from(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Missing field 'message",
-        )))
-    }
-}
-
-fn write_to_db(
-    new_message: Message,
-    db_connection: &PgConnection,
-) -> FutureResult<i64, hyper::Error> {
-    use schema::messages;
-    let timestamp = diesel::insert_into(messages::table)
-        .values(&new_message)
-        .returning(messages::timestamp)
-        .get_result(db_connection);
-
-    match timestamp {
-        Ok(timestamp) => futures::future::ok(timestamp),
-        Err(error) => {
-          error!("Error writing to database: {}", error.description());
-          futures::future::err(hyper::Error::from(
-              io::Error::new(io::ErrorKind::Other, "service error"),
-          ))
-        }
-    }
 }
 
 fn query_db(time_range: TimeRange, db_connection: &PgConnection) -> Option<Vec<Message>> {
@@ -174,52 +196,32 @@ fn render_page(messages: Vec<Message>) -> String {
     }).into_string()
 }
 
-
-fn make_post_response(
-    result: Result<i64, hyper::Error>,
-) -> FutureResult<hyper::Response, hyper::Error> {
-    match result {
-        Ok(timestamp) => {
-            let payload = json!({"timestamp": timestamp}).to_string();
-            let response = Response::new()
-                .with_header(ContentLength(payload.len() as u64))
-                .with_header(ContentType::json())
-                .with_body(payload);
-            debug!("{:?}", response);
-            futures::future::ok(response)
-        }
-        Err(error) => make_error_response("Error Posting Request"),
-    }
-}
-
 fn make_get_response(
     messages: Option<Vec<Message>>,
 ) -> FutureResult<hyper::Response, hyper::Error> {
     let response = match messages {
         Some(messages) => {
-            let body = json!({ "messages": messages }).to_string();
+            let body = render_page(messages);
             Response::new()
                 .with_header(ContentLength(body.len() as u64))
-                .with_header(ContentType::json())
                 .with_body(body)
         }
-        None => Response::new().with_status(StatusCode::InternalServerError)
+        None => Response::new().with_status(StatusCode::InternalServerError),
     };
     debug!("{:?}", response);
     futures::future::ok(response)
 }
 
-fn make_error_response(error_message: &str) -> FutureResult<hyper::Response, hyper::Error> {
-    let payload = json!({"error": error_message}).to_string();
-    let response = Response::new()
-        .with_status(StatusCode::InternalServerError)
-        .with_header(ContentLength(payload.len() as u64))
-        .with_header(ContentType::json())
-        .with_body(payload);
-    debug!("{:?}", response);
-    futures::future::ok(response)
+fn connect_to_db() -> Option<PgConnection> {
+    let database_url = env::var("DATABASE_URL").unwrap_or(String::from(DEFAULT_DATABASE_URL));
+    match PgConnection::establish(&database_url) {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            error!("Error connecting to database: {}", error.description());
+            None
+        }
+    }
 }
-
 
 impl Service for Microservice {
     type Request = Request;
@@ -235,14 +237,15 @@ impl Service for Microservice {
                 return Box::new(futures::future::ok(
                     Response::new().with_status(StatusCode::InternalServerError),
                 ))
-        }
+            }
+        };
         match (request.method(), request.path()) {
             (&Post, "/") => {
                 let future = request
                     .body()
                     .concat2()
                     .and_then(parse_form)
-                    .and_then(|move| write_to_db(new_message, &db_connection))
+                    .and_then(move |new_message| write_to_db(new_message, &db_connection))
                     .then(make_post_response);
                 Box::new(future)
             }
@@ -267,13 +270,11 @@ impl Service for Microservice {
     }
 }
 
-
 fn main() {
-    print!("running");
     env_logger::init();
-    let address = "127.0.0.1:8080".parse().unwrap();
+    let address = "0.0.0.0:5006".parse().unwrap();
     let server = hyper::server::Http::new()
-        .bind(&address, || Ok(Microservice {}))
+        .bind(&address, move || Ok(Microservice {}))
         .unwrap();
     info!("Running microservice at {}", address);
     server.run().unwrap();

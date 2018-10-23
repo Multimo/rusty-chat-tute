@@ -4,8 +4,6 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    networks:
-      - network
     ports:
        - "5006:5006"
     environment:
@@ -17,10 +15,5 @@ services:
       context: .
       dockerfile: docker/Dockerfile-db
     restart: always
-    networks:
-      - network
     environment:
       POSTGRES_PASSWORD: secret
-
-networks:
-  network:
